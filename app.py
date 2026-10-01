@@ -1,791 +1,354 @@
 import os
-import csv
-import io
-from functools import wraps
-from datetime import date, datetime, timedelta
-from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, Response, session
-import database
+import json
+import uuid
+import datetime
+from typing import Dict, Any, List
 
-app = Flask(__name__)
-app.secret_key = "barcode-inventory-secret-key"
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.responses import JSONResponse, HTMLResponse
+from starlette.staticfiles import StaticFiles
+from starlette.requests import Request
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 
-# Ensure DB is initialized
-database.init_db()
+from rag_engine import RAGEngine
+from ai_service import AIService
 
-API_SECRET_KEY = "barcode-api-secret-key-2026"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+POLICIES_DIR = os.path.join(BASE_DIR, "policies")
+UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if request.headers.get("X-API-KEY") == API_SECRET_KEY:
-            return f(*args, **kwargs)
-        if "user_id" not in session:
-            if request.path.startswith("/api/"):
-                return jsonify({"success": False, "message": "Authentication required. Please log in."}), 401
-            return redirect(url_for("login_page", next=request.url))
-        return f(*args, **kwargs)
-    return decorated_function
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+os.makedirs(STATIC_DIR, exist_ok=True)
+os.makedirs(TEMPLATES_DIR, exist_ok=True)
 
-def role_required(allowed_roles):
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            if request.headers.get("X-API-KEY") == API_SECRET_KEY:
-                return f(*args, **kwargs)
-            if "user_id" not in session:
-                if request.path.startswith("/api/"):
-                    return jsonify({"success": False, "message": "Authentication required. Please log in."}), 401
-                return redirect(url_for("login_page", next=request.url))
-            user_role = session.get("role", "viewer")
-            if user_role not in allowed_roles:
-                if request.path.startswith("/api/"):
-                    return jsonify({"success": False, "message": f"Access denied. Requires one of roles: {', '.join(allowed_roles)}"}), 403
-                flash(f"Access Denied: This action requires '{'/'.join(allowed_roles)}' privileges.", "danger")
-                return redirect(url_for("dashboard"))
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
+TICKETS_FILE = os.path.join(DATA_DIR, "tickets.json")
+ANALYTICS_FILE = os.path.join(DATA_DIR, "analytics.json")
 
-@app.context_processor
-def inject_user_context():
-    pending_count = 0
-    reset_count = 0
-    if "user_id" in session and session.get("role") == "admin":
+# Initialize RAG Engine and AI Service
+rag = RAGEngine(POLICIES_DIR, UPLOADS_DIR)
+ai_service = AIService()
+
+
+def load_tickets() -> List[Dict[str, Any]]:
+    if os.path.exists(TICKETS_FILE):
         try:
-            pending_count = database.get_pending_users_count()
-            reset_count = database.get_password_reset_count()
+            with open(TICKETS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+def save_tickets(tickets: List[Dict[str, Any]]):
+    with open(TICKETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(tickets, f, indent=2)
+
+
+def load_analytics() -> Dict[str, Any]:
+    if os.path.exists(ANALYTICS_FILE):
+        try:
+            with open(ANALYTICS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
             pass
     return {
-        "current_user": {
-            "id": session.get("user_id"),
-            "username": session.get("username"),
-            "full_name": session.get("full_name"),
-            "role": session.get("role")
-        } if "user_id" in session else None,
-        "pending_users_count": pending_count,
-        "reset_requests_count": reset_count,
-        "total_admin_notices": pending_count + reset_count
+        "totalQueries": 0,
+        "satisfiedCount": 0,
+        "escalatedCount": 0,
+        "topTopics": [],
+        "recentQueries": []
     }
 
-def _get_filtered_transactions(args, limit=200):
-    filter_type = args.get("type", None)
-    if filter_type not in ('IN', 'OUT'):
-        filter_type = None
-    preset = args.get("preset", "all")
-    start_date = args.get("start_date", "").strip() or None
-    end_date = args.get("end_date", "").strip() or None
-    search_query = args.get("q", "").strip() or None
 
-    today = date.today()
-    if preset == 'today':
-        start_date = today.isoformat()
-        end_date = today.isoformat()
-    elif preset == 'yesterday':
-        yesterday = today - timedelta(days=1)
-        start_date = yesterday.isoformat()
-        end_date = yesterday.isoformat()
-    elif preset == '7days':
-        start_date = (today - timedelta(days=7)).isoformat()
-        end_date = today.isoformat()
-    elif preset == '30days':
-        start_date = (today - timedelta(days=30)).isoformat()
-        end_date = today.isoformat()
-    elif preset == 'this_month':
-        start_date = today.replace(day=1).isoformat()
-        end_date = today.isoformat()
-    elif preset == 'custom':
-        # Keep user provided start_date and end_date
+def save_analytics(data: Dict[str, Any]):
+    with open(ANALYTICS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+# Route Handlers
+async def index(request: Request):
+    html_path = os.path.join(TEMPLATES_DIR, "index.html")
+    if os.path.exists(html_path):
+        with open(html_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return HTMLResponse(content)
+    return HTMLResponse("<h1>Astra HR & Ops Chatbot Backend Ready</h1>")
+
+
+async def chat_endpoint(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    message = body.get("message", "").strip()
+    history = body.get("history", [])
+
+    if not message:
+        return JSONResponse({"error": "Message is required"}, status_code=400)
+
+    # 1. Retrieve grounded policy chunks
+    retrieved_chunks = rag.retrieve(message, top_k=4)
+
+    # 2. Generate response (Gemini 3.8 Flash or Grounded Local Synthesizer)
+    result = ai_service.generate_response(message, retrieved_chunks, history)
+
+    # 3. Update Analytics
+    try:
+        analytics = load_analytics()
+        analytics["totalQueries"] = analytics.get("totalQueries", 0) + 1
+        
+        # Categorize query
+        cat = "General"
+        if retrieved_chunks:
+            cat = retrieved_chunks[0].get("category", "General")
+        
+        # Keep rolling recent queries
+        recent = analytics.get("recentQueries", [])
+        recent.insert(0, {
+            "query": message[:80],
+            "category": cat,
+            "engine": result["engine"],
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        })
+        analytics["recentQueries"] = recent[:20]
+        save_analytics(analytics)
+    except Exception as e:
+        print(f"Error updating analytics: {e}")
+
+    return JSONResponse(result)
+
+
+async def list_policies(request: Request):
+    docs = rag.list_documents()
+    return JSONResponse({"documents": docs, "total_chunks": len(rag.chunks)})
+
+
+async def get_policy(request: Request):
+    doc_id = request.path_params.get("doc_id", "")
+    doc = rag.get_document(doc_id)
+    if not doc:
+        return JSONResponse({"error": "Policy document not found"}, status_code=404)
+    return JSONResponse(doc)
+
+
+async def upload_document(request: Request):
+    try:
+        form = await request.form()
+        uploaded_file = form.get("file")
+        if not uploaded_file:
+            return JSONResponse({"error": "No file provided"}, status_code=400)
+
+        filename = uploaded_file.filename
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in [".md", ".txt", ".docx", ".pdf"]:
+            return JSONResponse({
+                "error": f"Unsupported file format '{ext}'. Allowed: .md, .txt, .docx, .pdf"
+            }, status_code=400)
+
+        # Secure filename and save
+        safe_filename = filename.replace(" ", "_")
+        dest_path = os.path.join(UPLOADS_DIR, safe_filename)
+        
+        content = await uploaded_file.read()
+        with open(dest_path, "wb") as f:
+            f.write(content)
+
+        # Index new document
+        doc_info = rag.add_uploaded_file(dest_path, safe_filename)
+
+        return JSONResponse({
+            "message": "File uploaded and indexed successfully",
+            "document": doc_info,
+            "total_chunks": len(rag.chunks)
+        })
+    except Exception as e:
+        return JSONResponse({"error": f"Upload failed: {str(e)}"}, status_code=500)
+
+
+async def delete_document(request: Request):
+    doc_id = request.path_params.get("doc_id", "")
+    success = rag.delete_document(doc_id)
+    if success:
+        return JSONResponse({"message": f"Document '{doc_id}' deleted successfully"})
+    return JSONResponse({"error": "Document not found or cannot be deleted"}, status_code=404)
+
+
+async def get_tickets(request: Request):
+    tickets = load_tickets()
+    return JSONResponse(tickets)
+
+
+async def create_ticket(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    subject = data.get("subject", "").strip()
+    description = data.get("description", "").strip()
+    if not subject or not description:
+        return JSONResponse({"error": "Subject and description are required"}, status_code=400)
+
+    tickets = load_tickets()
+    ticket_num = len(tickets) + 8030
+    new_ticket = {
+        "id": f"TICK-{ticket_num}",
+        "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "employeeName": data.get("employeeName", "Employee User"),
+        "employeeEmail": data.get("employeeEmail", "employee@company.com"),
+        "department": data.get("department", "Operations"),
+        "category": data.get("category", "General"),
+        "priority": data.get("priority", "Medium"),
+        "subject": subject,
+        "description": description,
+        "status": "Open",
+        "assignedTo": "Triage Specialist",
+        "resolutionNotes": "Ticket queued for review."
+    }
+
+    tickets.insert(0, new_ticket)
+    save_tickets(tickets)
+
+    # Increment escalated count in analytics
+    try:
+        analytics = load_analytics()
+        analytics["escalatedCount"] = analytics.get("escalatedCount", 0) + 1
+        save_analytics(analytics)
+    except Exception:
         pass
-    else:
-        preset = 'all'
 
-    txs = database.get_transactions_log(
-        limit=limit,
-        filter_type=filter_type,
-        start_date=start_date,
-        end_date=end_date,
-        search_query=search_query
-    )
-    return txs, filter_type, preset, start_date, end_date, search_query
+    return JSONResponse(new_ticket, status_code=201)
 
-# ----------------- AUTHENTICATION ROUTES ----------------- #
 
-@app.route("/login", methods=["GET", "POST"])
-def login_page():
-    if "user_id" in session:
-        return redirect(url_for("dashboard"))
-        
-    next_url = request.args.get("next") or request.form.get("next") or url_for("dashboard")
-    
-    if request.method == "POST":
-        user_id_input = request.form.get("user_id", "").strip() or request.form.get("username", "").strip()
-        password = request.form.get("password", "").strip()
-        
-        if not user_id_input:
-            flash("Sila masukkan User ID anda.", "warning")
-            return render_template("login.html", next_url=next_url)
-            
-        if not password:
-            flash("Sila masukkan Password anda.", "warning")
-            return render_template("login.html", next_url=next_url, user_id=user_id_input)
-
-        user, err = database.verify_user_credentials(user_id_input, password)
-        if user:
-            session["user_id"] = user["id"]
-            session["username"] = user["username"]
-            session["full_name"] = user["full_name"]
-            session["role"] = user["role"]
-            flash(f"Welcome back, {user['full_name']}! Logged in as {user['role'].title()}.", "success")
-            return redirect(next_url)
-        else:
-            flash(err or "User ID atau Password tidak sah.", "danger")
-            return render_template("login.html", next_url=next_url, user_id=user_id_input)
-            
-    return render_template("login.html", next_url=next_url)
-
-@app.route("/register", methods=["GET", "POST"])
-def register_page():
-    if "user_id" in session:
-        return redirect(url_for("dashboard"))
-        
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        full_name = request.form.get("full_name", "").strip()
-        password = request.form.get("password", "").strip()
-        confirm_password = request.form.get("confirm_password", "").strip()
-        role = request.form.get("role", "viewer").strip().lower()
-        
-        if not username or not full_name or not password:
-            flash("Sila lengkapkan semua ruangan bertanda *.", "warning")
-            return render_template("register.html", username=username, full_name=full_name, role=role)
-            
-        if len(username) < 3:
-            flash("User ID mestilah sekurang-kurangnya 3 aksara.", "warning")
-            return render_template("register.html", username=username, full_name=full_name, role=role)
-            
-        if password != confirm_password:
-            flash("Kata laluan dan pengesahan kata laluan tidak sepadan.", "danger")
-            return render_template("register.html", username=username, full_name=full_name, role=role)
-            
-        if len(password) < 4:
-            flash("Kata laluan mestilah sekurang-kurangnya 4 aksara.", "warning")
-            return render_template("register.html", username=username, full_name=full_name, role=role)
-            
-        try:
-            database.register_user(username, password, full_name, role)
-            flash(f"Permohonan pendaftaran untuk User ID '{username}' telah berjaya dihantar! Akaun anda sedang menunggu kelulusan daripada Administrator sebelum boleh log masuk.", "success")
-            return redirect(url_for("login_page", user_id=username))
-        except Exception as e:
-            flash(str(e), "danger")
-            return render_template("register.html", username=username, full_name=full_name, role=role)
-            
-    return render_template("register.html")
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    flash("You have been successfully logged out.", "info")
-    return redirect(url_for("login_page"))
-
-# ----------------- USER MANAGEMENT (ADMIN ONLY) ----------------- #
-
-@app.route("/users")
-@login_required
-@role_required(["admin"])
-def users_page():
-    users = database.get_all_users()
-    pending_users = database.get_pending_users()
-    reset_requests = database.get_password_reset_requests()
-    return render_template("users.html", users=users, pending_users=pending_users, reset_requests=reset_requests)
-
-@app.route("/api/forgot-password", methods=["POST"])
-def api_forgot_password():
-    data = request.get_json() or request.form
-    user_id = data.get("user_id", "").strip()
-    new_password = data.get("new_password", "").strip()
-    confirm_password = data.get("confirm_password", "").strip()
-    
-    if not user_id:
-        return jsonify({"success": False, "message": "Sila masukkan User ID anda."}), 400
-    if not new_password:
-        return jsonify({"success": False, "message": "Sila masukkan kata laluan baharu."}), 400
-    if len(new_password) < 4:
-        return jsonify({"success": False, "message": "Kata laluan baharu mestilah sekurang-kurangnya 4 aksara."}), 400
-    if new_password != confirm_password:
-        return jsonify({"success": False, "message": "Kata laluan dan pengesahan kata laluan tidak sepadan."}), 400
-        
+async def calculate_leave(request: Request):
     try:
-        database.request_password_reset(user_id, new_password)
-        return jsonify({
-            "success": True, 
-            "message": f"Permohonan reset kata laluan bagi User ID '{user_id}' telah berjaya dihantar kepada Administrator untuk kelulusan."
-        })
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 400
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
-@app.route("/api/users/approve-password-reset/<int:user_id>", methods=["POST"])
-@login_required
-@role_required(["admin"])
-def api_approve_password_reset(user_id):
+    start_date_str = data.get("startDate")
+    end_date_str = data.get("endDate")
+    leave_type = data.get("leaveType", "annual")
+
+    if not start_date_str or not end_date_str:
+        return JSONResponse({"error": "Start and End dates are required"}, status_code=400)
+
     try:
-        database.approve_password_reset(user_id)
-        return jsonify({"success": True, "message": "Kata laluan baharu pengguna telah berjaya diluluskan dan diaktifkan."})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 400
+        start_date = datetime.date.fromisoformat(start_date_str)
+        end_date = datetime.date.fromisoformat(end_date_str)
+    except ValueError:
+        return JSONResponse({"error": "Invalid date format. Use YYYY-MM-DD"}, status_code=400)
 
-@app.route("/api/users/reject-password-reset/<int:user_id>", methods=["POST"])
-@login_required
-@role_required(["admin"])
-def api_reject_password_reset(user_id):
-    try:
-        database.reject_password_reset(user_id)
-        return jsonify({"success": True, "message": "Permohonan reset kata laluan telah dibatalkan."})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 400
+    if end_date < start_date:
+        return JSONResponse({"error": "End date cannot be earlier than start date"}, status_code=400)
 
-@app.route("/api/users/add", methods=["POST"])
-@login_required
-@role_required(["admin"])
-def api_add_user():
-    data = request.get_json() or request.form
-    username = data.get("username", "").strip()
-    full_name = data.get("full_name", "").strip()
-    password = data.get("password", "").strip()
-    role = data.get("role", "staff").strip().lower()
-    
-    try:
-        user_id = database.create_user(username, password, full_name, role)
-        return jsonify({"success": True, "message": f"User '{username}' created successfully.", "user_id": user_id})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 400
+    # Calculate business days (Monday=0 to Friday=4)
+    total_days = 0
+    cur = start_date
+    while cur <= end_date:
+        if cur.weekday() < 5:  # Weekday
+            total_days += 1
+        cur += datetime.timedelta(days=1)
 
-@app.route("/api/users/update/<int:user_id>", methods=["POST"])
-@login_required
-@role_required(["admin"])
-def api_update_user(user_id):
-    data = request.get_json() or request.form
-    full_name = data.get("full_name")
-    role = data.get("role")
-    is_active = data.get("is_active")
-    if is_active is not None:
-        is_active = True if str(is_active).lower() in ('true', '1') else False
-    password = data.get("password")
-    if password and not str(password).strip():
-        password = None
-        
-    try:
-        database.update_user(user_id, full_name=full_name, role=role, is_active=is_active, password=password)
-        if session.get("user_id") == user_id:
-            if full_name: session["full_name"] = full_name
-            if role: session["role"] = role
-        return jsonify({"success": True, "message": "User details updated successfully."})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-
-@app.route("/api/users/delete/<int:user_id>", methods=["POST", "DELETE"])
-@login_required
-@role_required(["admin"])
-def api_delete_user(user_id):
-    if session.get("user_id") == user_id:
-        return jsonify({"success": False, "message": "You cannot delete your own active administrator account."}), 400
-    try:
-        database.delete_user(user_id)
-        return jsonify({"success": True, "message": "User deleted successfully."})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-
-@app.route("/api/users/approve/<int:user_id>", methods=["POST"])
-@login_required
-@role_required(["admin"])
-def api_approve_user(user_id):
-    data = request.get_json() or request.form or {}
-    role = data.get("role")
-    try:
-        database.approve_user(user_id, role=role)
-        return jsonify({"success": True, "message": "Permohonan pendaftaran pengguna berjaya diluluskan."})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-
-@app.route("/api/users/reject/<int:user_id>", methods=["POST", "DELETE"])
-@login_required
-@role_required(["admin"])
-def api_reject_user(user_id):
-    try:
-        database.reject_user(user_id)
-        return jsonify({"success": True, "message": "Permohonan pendaftaran pengguna telah ditolak."})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-
-# ----------------- WEB ROUTES ----------------- #
-
-@app.route("/")
-@login_required
-def dashboard():
-    summary = database.get_dashboard_summary()
-    if session.get("role") == "viewer":
-        summary["total_inventory_cost"] = 0.0
-        summary["total_inventory_sales"] = 0.0
-        summary["potential_profit"] = 0.0
-        summary["gross_margin_pct"] = 0.0
-        summary["expired_loss_value"] = 0.0
-    expiring_items = database.get_expiring_batches()
-    return render_template("dashboard.html", summary=summary, expiring_items=expiring_items)
-
-@app.route("/scan")
-@login_required
-def scan_page():
-    mode = request.args.get("mode", "check") # 'check', 'in', 'out'
-    if session.get("role") == "viewer" and mode in ("in", "out"):
-        flash("Auditors/Viewers have read-only access. Switched to Check Mode.", "warning")
-        mode = "check"
-    return render_template("scan.html", active_mode=mode)
-
-@app.route("/products")
-@login_required
-def products_page():
-    products = database.get_all_products()
-    if session.get("role") == "viewer":
-        for p in products:
-            p["cost_price"] = 0.0
-            p["selling_price"] = 0.0
-            p["total_cost_value"] = 0.0
-            p["total_sales_value"] = 0.0
-    return render_template("products.html", products=products)
-
-@app.route("/expiring")
-@login_required
-def expiring_page():
-    expiring_items = database.get_expiring_batches()
-    if session.get("role") == "viewer":
-        for item in expiring_items:
-            item["cost_price"] = 0.0
-            item["batch_cost_value"] = 0.0
-    return render_template("expiring.html", items=expiring_items)
-
-@app.route("/transactions")
-@login_required
-def transactions_page():
-    txs, filter_type, preset, start_date, end_date, search_query = _get_filtered_transactions(request.args, limit=200)
-    
-    total_count = len(txs)
-    total_in = sum(t['quantity'] for t in txs if t['type'] == 'IN')
-    total_out = sum(t['quantity'] for t in txs if t['type'] == 'OUT')
-    net_movement = total_in - total_out
-    
-    stats = {
-        "total_count": total_count,
-        "total_in": total_in,
-        "total_out": total_out,
-        "net_movement": net_movement
+    # Policy guidelines based on HR-POL-001
+    quotas = {
+        "annual": {"total": 20, "name": "Annual Paid Time Off (PTO)", "notice": "48 hours for <3 days, 2 weeks for >= 3 days"},
+        "sick": {"total": 10, "name": "Paid Sick & Medical Leave", "notice": "Doctor note required if >2 consecutive days"},
+        "parental": {"total": 80, "name": "Parental Leave (16 Weeks Primary)", "notice": "Requires 6 months tenure, 30 days notice"},
+        "bereavement": {"total": 5, "name": "Bereavement Leave", "notice": "5 days for immediate family, 2 days for extended"},
+        "floating": {"total": 2, "name": "Floating Personal Holiday", "notice": "24 hours advance notification"}
     }
-    
-    return render_template(
-        "transactions.html", 
-        transactions=txs, 
-        current_filter=filter_type,
-        preset=preset,
-        start_date=start_date or "",
-        end_date=end_date or "",
-        search_query=search_query or "",
-        stats=stats
-    )
 
-@app.route("/barcode-generator")
-@login_required
-def barcode_generator_page():
-    products = database.get_all_products()
-    return render_template("barcode_generator.html", products=products)
+    info = quotas.get(leave_type, quotas["annual"])
+    remaining_balance_simulated = max(0, info["total"] - total_days)
 
-# ----------------- EXPORT REPORTS (EXCEL / CSV) ----------------- #
+    return JSONResponse({
+        "leaveType": info["name"],
+        "startDate": str(start_date),
+        "endDate": str(end_date),
+        "requestedWorkingDays": total_days,
+        "annualEntitlement": info["total"],
+        "projectedRemaining": remaining_balance_simulated,
+        "policyNoticeRequirement": info["notice"],
+        "status": "Eligible for submission",
+        "simulationId": f"REQ-{str(uuid.uuid4())[:8].upper()}"
+    })
 
-@app.route("/export/transactions")
-@login_required
-def export_transactions():
-    txs, filter_type, preset, start_date, end_date, search_query = _get_filtered_transactions(request.args, limit=None)
-    
-    output = io.StringIO()
-    output.write('\ufeff') # UTF-8 BOM for Microsoft Excel
-    writer = csv.writer(output)
-    
-    writer.writerow([
-        "Transaction ID",
-        "Timestamp",
-        "Type",
-        "Barcode",
-        "Product Name",
-        "Batch No",
-        "Quantity",
-        "Expiration Date",
-        "Reference / Notes",
-        "Handled By"
-    ])
-    
-    for t in txs:
-        writer.writerow([
-            t['id'],
-            t['timestamp'],
-            t['type'],
-            f"'{t['barcode']}",
-            t['product_name'],
-            t['batch_no'] or 'N/A',
-            t['quantity'],
-            t['expiration_date'] or 'N/A',
-            t['reference'] or '',
-            t.get('user_name') or 'System'
-        ])
-        
-    filename = f"transactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    return Response(
-        output.getvalue(),
-        mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
-    )
 
-@app.route("/export/inventory")
-@login_required
-def export_inventory():
-    products = database.get_all_products()
-    is_viewer = session.get("role") == "viewer"
-    
-    output = io.StringIO()
-    output.write('\ufeff')
-    writer = csv.writer(output)
-    
-    if is_viewer:
-        writer.writerow([
-            "Barcode",
-            "Product Name",
-            "Category",
-            "Current Stock",
-            "Unit",
-            "Min Threshold",
-            "Stock Status",
-            "Earliest Expiry Date",
-            "Expired Batches Count",
-            "Expiring Soon Batches Count"
-        ])
-        for p in products:
-            if p['total_stock'] <= 0:
-                status = "Out of Stock"
-            elif p['total_stock'] <= p['min_stock']:
-                status = "Low Stock"
-            else:
-                status = "In Stock"
-                
-            writer.writerow([
-                f"'{p['barcode']}",
-                p['name'],
-                p['category'] or 'General',
-                p['total_stock'],
-                p['unit'] or 'Unit',
-                p['min_stock'],
-                status,
-                p['earliest_valid_expiry'] or 'No Expiry',
-                p['expired_batches_count'],
-                p['expiring_soon_batches_count']
-            ])
-    else:
-        writer.writerow([
-            "Barcode",
-            "Product Name",
-            "Category",
-            "Current Stock",
-            "Unit",
-            "Cost Price (RM)",
-            "Selling Price (RM)",
-            "Total Cost Value (RM)",
-            "Total Sales Value (RM)",
-            "Min Threshold",
-            "Stock Status",
-            "Earliest Expiry Date",
-            "Expired Batches Count",
-            "Expiring Soon Batches Count"
-        ])
-        for p in products:
-            if p['total_stock'] <= 0:
-                status = "Out of Stock"
-            elif p['total_stock'] <= p['min_stock']:
-                status = "Low Stock"
-            else:
-                status = "In Stock"
-                
-            writer.writerow([
-                f"'{p['barcode']}",
-                p['name'],
-                p['category'] or 'General',
-                p['total_stock'],
-                p['unit'] or 'Unit',
-                f"{p.get('cost_price', 0.0):.2f}",
-                f"{p.get('selling_price', 0.0):.2f}",
-                f"{p.get('total_cost_value', 0.0):.2f}",
-                f"{p.get('total_sales_value', 0.0):.2f}",
-                p['min_stock'],
-                status,
-                p['earliest_valid_expiry'] or 'No Expiry',
-                p['expired_batches_count'],
-                p['expiring_soon_batches_count']
-            ])
-        
-    filename = f"inventory_stock_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    return Response(
-        output.getvalue(),
-        mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
-    )
+async def get_analytics(request: Request):
+    data = load_analytics()
+    return JSONResponse(data)
 
-@app.route("/export/expiring")
-@login_required
-def export_expiring():
-    items = database.get_expiring_batches()
-    is_viewer = session.get("role") == "viewer"
-    
-    output = io.StringIO()
-    output.write('\ufeff')
-    writer = csv.writer(output)
-    
-    if is_viewer:
-        writer.writerow([
-            "Barcode",
-            "Product Name",
-            "Batch No",
-            "Quantity",
-            "Expiration Date",
-            "Status",
-            "Days Remaining"
-        ])
-        for item in items:
-            status_text = "Expired" if item['status'] == 'EXPIRED' else "Expiring Soon"
-            writer.writerow([
-                f"'{item['barcode']}",
-                item['product_name'],
-                item['batch_no'] or 'N/A',
-                item['quantity'],
-                item['expiration_date'],
-                status_text,
-                item['days_remaining']
-            ])
-    else:
-        writer.writerow([
-            "Barcode",
-            "Product Name",
-            "Batch No",
-            "Quantity",
-            "Unit Cost (RM)",
-            "Estimated Loss Value (RM)",
-            "Expiration Date",
-            "Status",
-            "Days Remaining"
-        ])
-        for item in items:
-            status_text = "Expired" if item['status'] == 'EXPIRED' else "Expiring Soon"
-            writer.writerow([
-                f"'{item['barcode']}",
-                item['product_name'],
-                item['batch_no'] or 'N/A',
-                item['quantity'],
-                f"{item.get('cost_price', 0.0):.2f}",
-                f"{item.get('batch_cost_value', 0.0):.2f}",
-                item['expiration_date'],
-                status_text,
-                item['days_remaining']
-            ])
-        
-    filename = f"expiring_batches_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    return Response(
-        output.getvalue(),
-        mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
-    )
 
-# ----------------- REST API (FOR SYSTEM & OFFICE INTEGRATION) ----------------- #
-
-@app.route("/api/product/<barcode>", methods=["GET"])
-@login_required
-def api_get_product(barcode):
-    prod = database.get_product_by_barcode(barcode)
-    if prod:
-        if session.get("role") == "viewer":
-            prod["cost_price"] = 0.0
-            prod["selling_price"] = 0.0
-            prod["total_cost_value"] = 0.0
-            prod["total_sales_value"] = 0.0
-        return jsonify({"success": True, "product": prod})
-    return jsonify({"success": False, "message": "Product not found"}), 404
-
-@app.route("/api/stock-in", methods=["POST"])
-@login_required
-@role_required(["admin", "staff"])
-def api_stock_in():
-    data = request.get_json() or request.form
-    barcode = data.get("barcode", "").strip()
-    name = data.get("name", "").strip()
-    quantity = data.get("quantity")
-    expiration_date = data.get("expiration_date", "").strip() or None
-    category = data.get("category", "General").strip()
-    unit = data.get("unit", "Unit").strip()
-    reference = data.get("reference", "Stock Received").strip()
-    cost_price = data.get("cost_price", None)
-    selling_price = data.get("selling_price", None)
-    
-    if not barcode:
-        return jsonify({"success": False, "message": "Barcode is required"}), 400
+async def record_feedback(request: Request):
     try:
-        qty = int(quantity)
-        if qty <= 0:
-            return jsonify({"success": False, "message": "Quantity must be greater than 0"}), 400
-    except (TypeError, ValueError):
-        return jsonify({"success": False, "message": "Invalid quantity"}), 400
+        data = await request.json()
+        rating = data.get("rating")
+        analytics = load_analytics()
+        if rating == "up":
+            analytics["satisfiedCount"] = analytics.get("satisfiedCount", 0) + 1
+        save_analytics(analytics)
+        return JSONResponse({"message": "Feedback recorded. Thank you!"})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-    u_id = session.get("user_id")
-    u_name = session.get("username") or "System"
 
+async def config_status(request: Request):
+    return JSONResponse({
+        "gemini_active": ai_service.is_gemini_active(),
+        "model": ai_service.model_name,
+        "total_documents": len(rag.documents),
+        "total_chunks": len(rag.chunks)
+    })
+
+
+async def update_api_key(request: Request):
     try:
-        res = database.stock_in(
-            barcode=barcode,
-            name=name,
-            quantity=qty,
-            expiration_date=expiration_date,
-            reference=reference,
-            category=category,
-            unit=unit,
-            cost_price=cost_price,
-            selling_price=selling_price,
-            user_id=u_id,
-            user_name=u_name
-        )
-        updated_prod = database.get_product_by_barcode(barcode)
-        return jsonify({
-            "success": True, 
-            "message": f"Successfully received {qty} unit(s) for {updated_prod['name']}",
-            "product": updated_prod
+        data = await request.json()
+        key = data.get("apiKey", "").strip()
+        success = ai_service.set_api_key(key)
+        return JSONResponse({
+            "success": success,
+            "gemini_active": ai_service.is_gemini_active(),
+            "model": ai_service.model_name,
+            "engine": "gemini-3.8-flash" if ai_service.is_gemini_active() else "local-rag-synthesizer"
         })
     except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-
-@app.route("/api/stock-out", methods=["POST"])
-@login_required
-@role_required(["admin", "staff"])
-def api_stock_out():
-    data = request.get_json() or request.form
-    barcode = data.get("barcode", "").strip()
-    quantity = data.get("quantity")
-    batch_id = data.get("batch_id")
-    reference = data.get("reference", "Stock Dispatched").strip()
-    
-    if not barcode:
-        return jsonify({"success": False, "message": "Barcode is required"}), 400
-    try:
-        qty = int(quantity)
-        if qty <= 0:
-            return jsonify({"success": False, "message": "Quantity must be greater than 0"}), 400
-    except (TypeError, ValueError):
-        return jsonify({"success": False, "message": "Invalid quantity"}), 400
-
-    batch_id_val = int(batch_id) if batch_id and str(batch_id).isdigit() else None
-    u_id = session.get("user_id")
-    u_name = session.get("username") or "System"
-
-    try:
-        res = database.stock_out(
-            barcode=barcode,
-            quantity=qty,
-            batch_id=batch_id_val,
-            reference=reference,
-            user_id=u_id,
-            user_name=u_name
-        )
-        updated_prod = database.get_product_by_barcode(barcode)
-        return jsonify({
-            "success": True, 
-            "message": f"Successfully dispatched {qty} unit(s) of {res['product_name']}",
-            "result": res,
-            "product": updated_prod
-        })
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-
-@app.route("/api/products", methods=["GET"])
-@login_required
-def api_list_products():
-    products = database.get_all_products()
-    if session.get("role") == "viewer":
-        for prod in products:
-            prod["cost_price"] = 0.0
-            prod["selling_price"] = 0.0
-            prod["total_cost_value"] = 0.0
-            prod["total_sales_value"] = 0.0
-    return jsonify({"success": True, "count": len(products), "products": products})
-
-@app.route("/api/product/save", methods=["POST"])
-@login_required
-@role_required(["admin", "staff"])
-def api_save_product():
-    data = request.get_json() or request.form
-    barcode = data.get("barcode", "").strip()
-    name = data.get("name", "").strip()
-    category = data.get("category", "General").strip()
-    unit = data.get("unit", "Unit").strip()
-    min_stock = data.get("min_stock", 5)
-    cost_price = data.get("cost_price", 0.0)
-    selling_price = data.get("selling_price", 0.0)
-
-    if not barcode or not name:
-        return jsonify({"success": False, "message": "Barcode and Product Name are required"}), 400
-
-    try:
-        min_s = int(min_stock)
-    except ValueError:
-        min_s = 5
-
-    try:
-        c_price = float(cost_price or 0.0)
-        s_price = float(selling_price or 0.0)
-    except ValueError:
-        c_price = 0.0
-        s_price = 0.0
-
-    try:
-        prod_id = database.create_or_update_product(barcode, name, category, unit, min_s, c_price, s_price)
-        return jsonify({"success": True, "message": "Product details saved successfully", "product_id": prod_id})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-
-@app.route("/api/product/delete/<int:product_id>", methods=["POST", "DELETE"])
-@login_required
-@role_required(["admin"])
-def api_delete_product(product_id):
-    try:
-        database.delete_product(product_id)
-        return jsonify({"success": True, "message": "Product deleted successfully"})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 400
-
-@app.route("/api/dashboard-stats", methods=["GET"])
-@login_required
-def api_dashboard_stats():
-    summary = database.get_dashboard_summary()
-    if session.get("role") == "viewer":
-        summary["total_inventory_cost"] = 0.0
-        summary["total_inventory_sales"] = 0.0
-        summary["potential_profit"] = 0.0
-        summary["gross_margin_pct"] = 0.0
-        summary["expired_loss_value"] = 0.0
-    return jsonify({"success": True, "data": summary})
-
-@app.route("/api/analytics/movement-trend", methods=["GET"])
-@login_required
-def api_movement_trend():
-    period = request.args.get("period", "").strip().lower()
-    start_date = request.args.get("start_date", "").strip() or None
-    end_date = request.args.get("end_date", "").strip() or None
-    data = database.get_movement_trend_data(period=period or '7days', start_date=start_date, end_date=end_date)
-    return jsonify({"success": True, "data": data})
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# Starlette Application Routes
+routes = [
+    Route("/", endpoint=index, methods=["GET"]),
+    Route("/api/chat", endpoint=chat_endpoint, methods=["POST"]),
+    Route("/api/policies", endpoint=list_policies, methods=["GET"]),
+    Route("/api/policies/{doc_id}", endpoint=get_policy, methods=["GET"]),
+    Route("/api/documents/upload", endpoint=upload_document, methods=["POST"]),
+    Route("/api/documents/{doc_id}", endpoint=delete_document, methods=["DELETE"]),
+    Route("/api/tickets", endpoint=get_tickets, methods=["GET"]),
+    Route("/api/tickets", endpoint=create_ticket, methods=["POST"]),
+    Route("/api/leave/calculate", endpoint=calculate_leave, methods=["POST"]),
+    Route("/api/analytics", endpoint=get_analytics, methods=["GET"]),
+    Route("/api/feedback", endpoint=record_feedback, methods=["POST"]),
+    Route("/api/config/status", endpoint=config_status, methods=["GET"]),
+    Route("/api/config/key", endpoint=update_api_key, methods=["POST"]),
+    Mount("/static", app=StaticFiles(directory=STATIC_DIR), name="static")
+]
 
+middleware = [
+    Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+]
+
+app = Starlette(debug=True, routes=routes, middleware=middleware)
 
 if __name__ == "__main__":
-    print("Starting NexusScan - Barcode & Inventory System...")
-    print("Open web browser at: http://127.0.0.1:5000 (or your Raspberry Pi IP address)")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    import uvicorn
+    print("Starting Astra HR & Operations AI Chatbot Server at http://127.0.0.1:8000 ...")
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
