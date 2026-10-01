@@ -237,9 +237,9 @@ routes = [
     Route("/api/security/events", get_security_events, methods=["GET"]),
     Route("/api/chat", chat, methods=["POST"]),
     Route("/api/inventory", get_inventory, methods=["GET"]),
-    Route("/api/inventory/{barcode}", get_inventory_product, methods=["GET"]),
     Route("/api/inventory/stock-in", stock_in, methods=["POST"]),
     Route("/api/inventory/stock-out", stock_out, methods=["POST"]),
+    Route("/api/inventory/{barcode}", get_inventory_product, methods=["GET"]),
     Route("/api/attendance", get_attendance, methods=["GET"]),
     Route("/api/attendance", post_attendance, methods=["POST"]),
 ]
